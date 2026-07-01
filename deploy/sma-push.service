@@ -1,0 +1,17 @@
+[Unit]
+Description=Envía lecturas SMA al VPS (sma_push.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gironasa
+WorkingDirectory=/home/gironasa/sma-reader
+EnvironmentFile=/home/gironasa/sma-reader/.env
+# Intervalo entre ciclos; ajusta -i (mínimo práctico ~10s en LAN estable)
+ExecStart=/home/gironasa/sma-reader/venv/bin/python sma_push.py -w -i 60
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

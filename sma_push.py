@@ -43,6 +43,21 @@ from sma_plant import (
 
 DEFAULT_INTERVAL = 60.0
 CACHE_FILE = Path(__file__).with_name(".sma_push_cache.json")
+ENV_FILE = Path(__file__).with_name(".env")
+
+
+def load_dotenv(path: Path = ENV_FILE) -> None:
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def _env_float(name: str, default: float) -> float:
@@ -127,6 +142,7 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="Una lectura y salir")
     parser.add_argument("-q", "--quiet", action="store_true")
     args = parser.parse_args()
+    load_dotenv()
 
     config = load_config()
     if args.vps_url:

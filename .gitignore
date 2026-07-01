@@ -3,4 +3,5 @@ __pycache__/
 *.py[cod]
 .Python
 .env
+.sma_push_cache.json
 .DS_Store

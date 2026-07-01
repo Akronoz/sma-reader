@@ -11,6 +11,10 @@ Uso:
   python sma_plant.py                  # lectura rápida (~3-10 s)
   python sma_plant.py --slow           # si la WiFi del inversor es inestable
   python sma_plant.py -w -i 10         # monitor cada 10 s
+
+Envío al VPS (script aparte):
+  python sma_push.py --once
+  python sma_push.py -w -i 60
 """
 
 from __future__ import annotations
@@ -476,6 +480,38 @@ class SmaPlantReader:
                 snap.dc_strings.append(reading)
 
         return snap
+
+
+def reading_to_dict(reading: Reading) -> dict:
+    return {
+        "label": reading.label,
+        "value": reading.value,
+        "unit": reading.unit,
+        "error": reading.error,
+    }
+
+
+def snapshot_to_dict(snap: PlantSnapshot, elapsed_s: float | None = None) -> dict:
+    data = {
+        "timestamp": snap.timestamp,
+        "host": snap.host,
+        "inverter_unit": snap.inverter_unit,
+        "meter_unit": snap.meter_unit,
+        "inverter_power": reading_to_dict(snap.inverter_power),
+        "meter_import": reading_to_dict(snap.meter_import),
+        "meter_export": reading_to_dict(snap.meter_export),
+        "meter_balance": reading_to_dict(snap.meter_balance),
+        "site_consumption": reading_to_dict(snap.site_consumption),
+        "meter_apparent_total": reading_to_dict(snap.meter_apparent_total),
+        "meter_frequency": reading_to_dict(snap.meter_frequency),
+        "meter_export_phases": [reading_to_dict(r) for r in snap.meter_export_phases],
+        "meter_apparent_phases": [reading_to_dict(r) for r in snap.meter_apparent_phases],
+        "meter_voltage": [reading_to_dict(r) for r in snap.meter_voltage],
+        "dc_strings": [reading_to_dict(r) for r in snap.dc_strings],
+    }
+    if elapsed_s is not None:
+        data["read_duration_s"] = round(elapsed_s, 2)
+    return data
 
 
 def print_snapshot(snap: PlantSnapshot, elapsed_s: float | None = None) -> None:

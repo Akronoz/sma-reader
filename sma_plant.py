@@ -561,6 +561,107 @@ def print_snapshot(snap: PlantSnapshot, elapsed_s: float | None = None) -> None:
         print("  No leídos (usa --try-strings para intentar; suele fallar en este modelo).")
 
 
+DebugProbe = tuple[int, int, str, float, str, str]  # unit, addr, dtype, scale, unit_label, label
+
+DEBUG_PROBES: list[DebugProbe] = [
+    (INVERTER_UNIT, 30775, "s32", 1, "W", "Inversor Potencia AC (30775)"),
+    (METER_UNIT, 30865, "s32", 1 / 1000, "kW", "Vatímetro Import TotWIn (30865)"),
+    (METER_UNIT, 30867, "s32", 1 / 1000, "kW", "Vatímetro Export TotWOut (30867)"),
+    (METER_UNIT, 31447, "u32", 0.01, "Hz", "Vatímetro Frecuencia (31447)"),
+    (METER_UNIT, 31455, "s32", 1 / 1000, "kVA", "Vatímetro TotVA (31455)"),
+    (METER_UNIT, 31259, "u32", 1 / 1000, "kW", "Vatímetro Export L1 (31259)"),
+    (METER_UNIT, 31261, "u32", 1 / 1000, "kW", "Vatímetro Export L2 (31261)"),
+    (METER_UNIT, 31263, "u32", 1 / 1000, "kW", "Vatímetro Export L3 (31263)"),
+]
+
+
+def _format_raw_regs(regs: list[int]) -> str:
+    return f"[{', '.join(f'0x{r:04X} ({r})' for r in regs)}]"
+
+
+def _scaled_value(raw: int | None, scale: float) -> str:
+    if raw is None:
+        return "N/A"
+    return f"{raw * scale:.4f}"
+
+
+def debug_modbus(
+    reader: SmaPlantReader,
+    samples: int = 5,
+    pause_s: float = 2.0,
+) -> None:
+    """Lecturas repetidas con registros raw para detectar valores congelados."""
+    print(f"Depuración Modbus — {reader.host}:{reader.port}")
+    print(
+        f"Inversor unit={reader.inverter_unit} | Vatímetro unit={reader.meter_unit} | "
+        f"{samples} muestras cada {pause_s}s\n"
+    )
+
+    client = ModbusTcpClient(reader.host, port=reader.port, timeout=reader.timeout, retries=0)
+    if not client.connect():
+        print("ERROR: sin conexión al Data Manager", file=sys.stderr)
+        return
+
+    history: dict[str, list[str]] = {label: [] for *_, label in DEBUG_PROBES}
+
+    try:
+        for sample in range(1, samples + 1):
+            ts = time.strftime("%H:%M:%S")
+            print(f"--- Muestra {sample}/{samples} [{ts}] ---")
+
+            for unit_id, addr, dtype, scale, unit_label, label in DEBUG_PROBES:
+                try:
+                    response = client.read_holding_registers(
+                        address=addr, count=2, device_id=unit_id
+                    )
+                    if response.isError():
+                        line = f"ERROR {response}"
+                    else:
+                        raw = decode(response.registers, dtype)
+                        line = (
+                            f"raw={_scaled_value(raw, scale)} {unit_label} "
+                            f"({_format_raw_regs(response.registers)})"
+                        )
+                except ModbusException as exc:
+                    line = f"ERROR Modbus: {exc}"
+                except Exception as exc:  # noqa: BLE001
+                    line = f"ERROR: {exc}"
+
+                history[label].append(line)
+                print(f"  {label:<40s} {line}")
+
+            # Comparar lectura en bloque vs individual en import/export
+            try:
+                block = client.read_holding_registers(
+                    address=30865, count=4, device_id=reader.meter_unit
+                )
+                if block.isError():
+                    print(f"  Bloque 30865×4                      ERROR {block}")
+                else:
+                    imp = decode(block.registers[0:2], "s32")
+                    exp = decode(block.registers[2:4], "s32")
+                    print(
+                        f"  Bloque 30865×4                      "
+                        f"import={_scaled_value(imp, 1/1000)} kW | "
+                        f"export={_scaled_value(exp, 1/1000)} kW | "
+                        f"{_format_raw_regs(block.registers)}"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                print(f"  Bloque 30865×4                      ERROR: {exc}")
+
+            if sample < samples:
+                time.sleep(pause_s)
+            print()
+
+        print("--- Resumen: ¿cambia entre muestras? ---")
+        for label, values in history.items():
+            unique = len(set(values))
+            status = "VARÍA" if unique > 1 else "CONGELADO"
+            print(f"  {label:<40s} {status} ({unique} valor/es distinto/s)")
+    finally:
+        client.close()
+
+
 def watch(reader: SmaPlantReader, interval: float) -> None:
     print(f"Monitorizando cada {interval}s (Ctrl+C para salir)\n")
     try:
@@ -605,6 +706,23 @@ def main() -> int:
         action="store_true",
         help="Mostrar detalle por fase del vatímetro (exportación activa, VA, tensión)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Depuración: lecturas raw repetidas para detectar registros congelados",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=5,
+        help="Número de muestras con --debug (default: 5)",
+    )
+    parser.add_argument(
+        "--debug-interval",
+        type=float,
+        default=2.0,
+        help="Segundos entre muestras con --debug (default: 2)",
+    )
     args = parser.parse_args()
 
     timeout = SLOW_TIMEOUT if args.slow else args.timeout
@@ -623,7 +741,9 @@ def main() -> int:
     reader.try_strings = args.try_strings
     reader.show_phases = args.phases
 
-    if args.watch:
+    if args.debug:
+        debug_modbus(reader, samples=args.samples, pause_s=args.debug_interval)
+    elif args.watch:
         watch(reader, args.interval)
     else:
         t0 = time.monotonic()

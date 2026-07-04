@@ -45,7 +45,14 @@ SLOW_RETRIES = 3
 NAN_S32 = 0x80000000
 NAN_U32 = 0xFFFFFFFF
 
+METER_STALE_ERROR = "Vatímetro sin actualizar (dato obsoleto)"
+STALE_PROBE_INTERVAL_S = 1.0
+STALE_INVERTER_DELTA_W = 50
+STALE_MIN_EXPORT_KW = 0.5
+STALE_MIN_INVERTER_W = 100
+
 RegisterDef = tuple[int, str, float, str, str]  # addr, dtype, scale, unit, label
+MeterFingerprint = tuple[int, ...]
 BlockDef = tuple[int, int, list[tuple[int, str, float, str, str]]]
 # block: (start_addr, register_count, [(addr, dtype, scale, unit, label), ...])
 
@@ -98,6 +105,8 @@ class PlantSnapshot:
     meter_apparent_phases: list[Reading] = field(default_factory=list)
     meter_voltage: list[Reading] = field(default_factory=list)
     dc_strings: list[Reading] = field(default_factory=list)
+    meter_stale: bool = False
+    meter_stale_reason: str | None = None
 
 
 def decode(registers: list[int], dtype: str) -> int | None:
@@ -171,6 +180,10 @@ class SmaPlantReader:
         self.retries = retries
         self.try_strings = False
         self.show_phases = False
+        self.stale_check = True
+        self._meter_fp: MeterFingerprint | None = None
+        self._meter_fp_repeat = 0
+        self._inv_raws_since_meter_fp: set[int] = set()
 
     def _pause(self) -> None:
         if self.delay > 0:
@@ -190,6 +203,74 @@ class SmaPlantReader:
             return None, str(exc)
         except Exception as exc:  # noqa: BLE001
             return None, str(exc)
+
+    def _read_register_words(
+        self, client: ModbusTcpClient, unit_id: int, addr: int, count: int = 2
+    ) -> tuple[int, ...] | None:
+        try:
+            response = client.read_holding_registers(
+                address=addr, count=count, device_id=unit_id
+            )
+            if response.isError():
+                return None
+            return tuple(response.registers)
+        except (ModbusException, Exception):  # noqa: BLE001
+            return None
+
+    def _read_inverter_power_raw(self, client: ModbusTcpClient) -> int | None:
+        words = self._read_register_words(client, self.inverter_unit, 30775)
+        return None if words is None else decode(list(words), "s32")
+
+    def _read_meter_fingerprint(self, client: ModbusTcpClient) -> MeterFingerprint | None:
+        parts: list[int] = []
+        for addr in (30865, 30867, 31447, 31455):
+            words = self._read_register_words(client, self.meter_unit, addr)
+            if words is None:
+                return None
+            parts.extend(words)
+        return tuple(parts)
+
+    def _check_meter_stale(
+        self,
+        inv_raw_start: int | None,
+        inv_raw_end: int | None,
+        meter_fp_start: MeterFingerprint | None,
+        meter_fp_end: MeterFingerprint | None,
+        inverter_w: float | None,
+        export_kw: float | None,
+        import_kw: float | None,
+    ) -> str | None:
+        if (
+            meter_fp_start is not None
+            and meter_fp_end is not None
+            and meter_fp_start == meter_fp_end
+            and inv_raw_start is not None
+            and inv_raw_end is not None
+            and abs(inv_raw_end - inv_raw_start) >= STALE_INVERTER_DELTA_W
+        ):
+            return METER_STALE_ERROR
+
+        inv = inverter_w or 0.0
+        exp = export_kw or 0.0
+        imp = import_kw or 0.0
+        if inv < STALE_MIN_INVERTER_W and (
+            exp >= STALE_MIN_EXPORT_KW or imp >= STALE_MIN_EXPORT_KW
+        ):
+            return METER_STALE_ERROR
+
+        if meter_fp_end is not None:
+            if meter_fp_end == self._meter_fp:
+                self._meter_fp_repeat += 1
+            else:
+                self._meter_fp = meter_fp_end
+                self._meter_fp_repeat = 1
+                self._inv_raws_since_meter_fp = set()
+            if inv_raw_end is not None:
+                self._inv_raws_since_meter_fp.add(inv_raw_end)
+            if self._meter_fp_repeat >= 2 and len(self._inv_raws_since_meter_fp) >= 2:
+                return METER_STALE_ERROR
+
+        return None
 
     def _read_with_retries(
         self,
@@ -294,18 +375,31 @@ class SmaPlantReader:
         self,
         probe_strings: bool,
         probe_phases: bool,
-    ) -> tuple[dict[str, Reading], dict[str, Reading]]:
+    ) -> tuple[
+        dict[str, Reading],
+        dict[str, Reading],
+        int | None,
+        int | None,
+        MeterFingerprint | None,
+        MeterFingerprint | None,
+    ]:
         inv: dict[str, Reading] = {}
         meter: dict[str, Reading] = {}
+        inv_raw_start: int | None = None
+        inv_raw_end: int | None = None
+        meter_fp_start: MeterFingerprint | None = None
+        meter_fp_end: MeterFingerprint | None = None
 
         client = ModbusTcpClient(self.host, port=self.port, timeout=self.timeout, retries=0)
         if not client.connect():
             inv["Potencia AC"] = Reading("Potencia AC", unit="W", error="Sin conexión")
             for _, _, _, unit, label in METER_CORE_REGISTERS:
                 meter[label] = Reading(label, unit=unit, error="Sin conexión")
-            return inv, meter
+            return inv, meter, None, None, None, None
 
         try:
+            inv_raw_start = self._read_inverter_power_raw(client)
+
             # Inversor: 1 petición
             inv.update(
                 self._read_block(
@@ -367,6 +461,12 @@ class SmaPlantReader:
                 )
             )
 
+            meter_fp_start = self._read_meter_fingerprint(client)
+            if self.stale_check:
+                time.sleep(STALE_PROBE_INTERVAL_S)
+                inv_raw_end = self._read_inverter_power_raw(client)
+                meter_fp_end = self._read_meter_fingerprint(client)
+
             if probe_phases:
                 meter.update(
                     self._read_block(
@@ -402,7 +502,7 @@ class SmaPlantReader:
         finally:
             client.close()
 
-        return inv, meter
+        return inv, meter, inv_raw_start, inv_raw_end, meter_fp_start, meter_fp_end
 
     def read_snapshot(
         self,
@@ -419,7 +519,9 @@ class SmaPlantReader:
             meter_unit=self.meter_unit,
         )
 
-        inv, meter = self._read_snapshot_fast(probe_strings, probe_phases)
+        inv, meter, inv_raw_start, inv_raw_end, meter_fp_start, meter_fp_end = (
+            self._read_snapshot_fast(probe_strings, probe_phases)
+        )
 
         if "Potencia AC" in inv:
             snap.inverter_power = inv["Potencia AC"]
@@ -479,7 +581,42 @@ class SmaPlantReader:
             if label != "Potencia AC" and (reading.value is not None or probe_strings):
                 snap.dc_strings.append(reading)
 
+        if self.stale_check:
+            stale_reason = self._check_meter_stale(
+                inv_raw_start,
+                inv_raw_end,
+                meter_fp_start,
+                meter_fp_end,
+                snap.inverter_power.value,
+                snap.meter_export.value,
+                snap.meter_import.value,
+            )
+            if stale_reason:
+                invalidate_meter_snapshot(snap, stale_reason)
+
         return snap
+
+
+def invalidate_meter_snapshot(snap: PlantSnapshot, reason: str) -> None:
+    snap.meter_stale = True
+    snap.meter_stale_reason = reason
+    for reading in (
+        snap.meter_import,
+        snap.meter_export,
+        snap.meter_balance,
+        snap.site_consumption,
+        snap.meter_apparent_total,
+        snap.meter_frequency,
+    ):
+        reading.value = None
+        reading.error = reason
+    snap.meter_export_phases = [
+        Reading(r.label, unit=r.unit, error=reason) for r in snap.meter_export_phases
+    ]
+    snap.meter_apparent_phases = [
+        Reading(r.label, unit=r.unit, error=reason) for r in snap.meter_apparent_phases
+    ]
+    snap.meter_voltage = [Reading(r.label, unit=r.unit, error=reason) for r in snap.meter_voltage]
 
 
 def reading_to_dict(reading: Reading) -> dict:
@@ -508,6 +645,8 @@ def snapshot_to_dict(snap: PlantSnapshot, elapsed_s: float | None = None) -> dic
         "meter_apparent_phases": [reading_to_dict(r) for r in snap.meter_apparent_phases],
         "meter_voltage": [reading_to_dict(r) for r in snap.meter_voltage],
         "dc_strings": [reading_to_dict(r) for r in snap.dc_strings],
+        "meter_stale": snap.meter_stale,
+        "meter_stale_reason": snap.meter_stale_reason,
     }
     if elapsed_s is not None:
         data["read_duration_s"] = round(elapsed_s, 2)
@@ -529,6 +668,8 @@ def print_snapshot(snap: PlantSnapshot, elapsed_s: float | None = None) -> None:
     print(f"  {snap.inverter_power.label:30s} {snap.inverter_power.formatted()}")
 
     print("\n--- Vatímetro ---")
+    if snap.meter_stale:
+        print(f"  ⚠ {snap.meter_stale_reason}")
     print(f"  {snap.meter_import.label:30s} {snap.meter_import.formatted()}")
     print(f"  {snap.meter_export.label:30s} {snap.meter_export.formatted()}")
     print(f"  {snap.meter_balance.label:30s} {snap.meter_balance.formatted()}")
@@ -563,17 +704,6 @@ def print_snapshot(snap: PlantSnapshot, elapsed_s: float | None = None) -> None:
 
 DebugProbe = tuple[int, int, str, float, str, str]  # unit, addr, dtype, scale, unit_label, label
 
-DEBUG_PROBES: list[DebugProbe] = [
-    (INVERTER_UNIT, 30775, "s32", 1, "W", "Inversor Potencia AC (30775)"),
-    (METER_UNIT, 30865, "s32", 1 / 1000, "kW", "Vatímetro Import TotWIn (30865)"),
-    (METER_UNIT, 30867, "s32", 1 / 1000, "kW", "Vatímetro Export TotWOut (30867)"),
-    (METER_UNIT, 31447, "u32", 0.01, "Hz", "Vatímetro Frecuencia (31447)"),
-    (METER_UNIT, 31455, "s32", 1 / 1000, "kVA", "Vatímetro TotVA (31455)"),
-    (METER_UNIT, 31259, "u32", 1 / 1000, "kW", "Vatímetro Export L1 (31259)"),
-    (METER_UNIT, 31261, "u32", 1 / 1000, "kW", "Vatímetro Export L2 (31261)"),
-    (METER_UNIT, 31263, "u32", 1 / 1000, "kW", "Vatímetro Export L3 (31263)"),
-]
-
 
 def _format_raw_regs(regs: list[int]) -> str:
     return f"[{', '.join(f'0x{r:04X} ({r})' for r in regs)}]"
@@ -585,12 +715,26 @@ def _scaled_value(raw: int | None, scale: float) -> str:
     return f"{raw * scale:.4f}"
 
 
+def _debug_probes_for(reader: SmaPlantReader) -> list[DebugProbe]:
+    return [
+        (reader.inverter_unit, 30775, "s32", 1, "W", "Inversor Potencia AC (30775)"),
+        (reader.meter_unit, 30865, "s32", 1 / 1000, "kW", "Vatímetro Import TotWIn (30865)"),
+        (reader.meter_unit, 30867, "s32", 1 / 1000, "kW", "Vatímetro Export TotWOut (30867)"),
+        (reader.meter_unit, 31447, "u32", 0.01, "Hz", "Vatímetro Frecuencia (31447)"),
+        (reader.meter_unit, 31455, "s32", 1 / 1000, "kVA", "Vatímetro TotVA (31455)"),
+        (reader.meter_unit, 31259, "u32", 1 / 1000, "kW", "Vatímetro Export L1 (31259)"),
+        (reader.meter_unit, 31261, "u32", 1 / 1000, "kW", "Vatímetro Export L2 (31261)"),
+        (reader.meter_unit, 31263, "u32", 1 / 1000, "kW", "Vatímetro Export L3 (31263)"),
+    ]
+
+
 def debug_modbus(
     reader: SmaPlantReader,
     samples: int = 5,
     pause_s: float = 2.0,
 ) -> None:
     """Lecturas repetidas con registros raw para detectar valores congelados."""
+    probes = _debug_probes_for(reader)
     print(f"Depuración Modbus — {reader.host}:{reader.port}")
     print(
         f"Inversor unit={reader.inverter_unit} | Vatímetro unit={reader.meter_unit} | "
@@ -602,14 +746,14 @@ def debug_modbus(
         print("ERROR: sin conexión al Data Manager", file=sys.stderr)
         return
 
-    history: dict[str, list[str]] = {label: [] for *_, label in DEBUG_PROBES}
+    history: dict[str, list[str]] = {label: [] for *_, label in probes}
 
     try:
         for sample in range(1, samples + 1):
             ts = time.strftime("%H:%M:%S")
             print(f"--- Muestra {sample}/{samples} [{ts}] ---")
 
-            for unit_id, addr, dtype, scale, unit_label, label in DEBUG_PROBES:
+            for unit_id, addr, dtype, scale, unit_label, label in probes:
                 try:
                     response = client.read_holding_registers(
                         address=addr, count=2, device_id=unit_id
@@ -723,6 +867,11 @@ def main() -> int:
         default=2.0,
         help="Segundos entre muestras con --debug (default: 2)",
     )
+    parser.add_argument(
+        "--no-stale-check",
+        action="store_true",
+        help="No invalidar lecturas del vatímetro aunque parezcan obsoletas",
+    )
     args = parser.parse_args()
 
     timeout = SLOW_TIMEOUT if args.slow else args.timeout
@@ -740,6 +889,7 @@ def main() -> int:
     )
     reader.try_strings = args.try_strings
     reader.show_phases = args.phases
+    reader.stale_check = not args.no_stale_check
 
     if args.debug:
         debug_modbus(reader, samples=args.samples, pause_s=args.debug_interval)

@@ -8,6 +8,7 @@ Variables de entorno:
   SMA_INTERVAL    Segundos entre envíos (default: 60)
   SMA_MODBUS_HOST IP del Data Manager (default: 192.168.1.101)
   SMA_SLOW        "1" para modo red lenta (mismos valores que sma_plant.py --slow)
+  SMA_STALE_CHECK "0" para desactivar la detección de vatímetro obsoleto
 
 Uso:
   python sma_push.py --once          # prueba: una lectura y un envío
@@ -83,6 +84,7 @@ def load_config() -> dict:
         "timeout": SLOW_TIMEOUT if slow else _env_float("SMA_MODBUS_TIMEOUT", DEFAULT_TIMEOUT),
         "delay": SLOW_DELAY if slow else _env_float("SMA_MODBUS_DELAY", DEFAULT_DELAY),
         "retries": SLOW_RETRIES if slow else _env_int("SMA_MODBUS_RETRIES", DEFAULT_RETRIES),
+        "stale_check": os.environ.get("SMA_STALE_CHECK", "1").lower() not in {"0", "false", "no"},
     }
 
 
@@ -123,8 +125,11 @@ def push_once(reader: SmaPlantReader, config: dict, verbose: bool = True) -> boo
     if verbose:
         prod = snap.inverter_power.formatted()
         cons = snap.site_consumption.formatted()
+        meter_note = " | Vatímetro obsoleto" if snap.meter_stale else ""
         if ok:
-            print(f"[{payload['sent_at']}] OK ({detail}) | Producción={prod} | Consumo={cons}")
+            print(
+                f"[{payload['sent_at']}] OK ({detail}) | Producción={prod} | Consumo={cons}{meter_note}"
+            )
         else:
             print(
                 f"[{payload['sent_at']}] ERROR: {detail} (último snapshot en {CACHE_FILE})",
@@ -168,6 +173,7 @@ def main() -> int:
         delay=config["delay"],
         retries=config["retries"],
     )
+    reader.stale_check = config["stale_check"]
 
     loop = args.watch or not args.once
     if loop:

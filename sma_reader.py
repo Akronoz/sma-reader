@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lector Modbus TCP para inversores SMA."""
+"""Modbus TCP reader for SMA inverters."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from pymodbus.exceptions import ModbusException
 
 RegisterDef = tuple[int, int, str, float, str, str]
 
-# Registros verificados en el inversor 100 kW de la red local.
+# Registers verified on the local network 100 kW inverter.
 CORE_REGISTERS: list[RegisterDef] = [
     (30775, 2, "s32", 1, "GridMs.TotW", "Potencia AC total"),
     (30513, 4, "u64", 1, "Metering.TotWhOut", "Energía total producida"),
@@ -24,8 +24,8 @@ CORE_REGISTERS: list[RegisterDef] = [
     (30005, 2, "u32", 1, "Nameplate.SerNum", "Número de serie"),
 ]
 
-# Registros adicionales según documentación SMA. Pueden no estar disponibles
-# en todos los modelos o configuraciones de gateway.
+# Additional registers per SMA documentation. May not be available
+# on all models or gateway configurations.
 EXTENDED_REGISTERS: list[RegisterDef] = [
     (30777, 2, "s32", 1, "GridMs.W.phsA", "Potencia L1"),
     (30779, 2, "s32", 1, "GridMs.W.phsB", "Potencia L2"),
@@ -50,11 +50,11 @@ EXTENDED_REGISTERS: list[RegisterDef] = [
 REGISTERS = CORE_REGISTERS + EXTENDED_REGISTERS
 
 HEALTH_STATUS = {
-    303: "Apagado",
+    303: "Off",
     307: "Ok",
-    455: "Advertencia",
+    455: "Warning",
     1392: "Error",
-    308: "Encendido",
+    308: "On",
 }
 
 NAN_VALUES = {
@@ -167,7 +167,7 @@ class SmaModbusReader:
 
     def __enter__(self) -> "SmaModbusReader":
         if not self.connect():
-            raise ConnectionError(f"No se pudo conectar a {self.host}:{self.port}")
+            raise ConnectionError(f"Could not connect to {self.host}:{self.port}")
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -184,9 +184,9 @@ class SmaModbusReader:
     ) -> RegisterValue:
         unit = UNITS.get(name, "")
         if not self._client:
-            return RegisterValue(address, name, description, None, unit, error="Sin conexión")
+            return RegisterValue(address, name, description, None, unit, error="No connection")
 
-        last_error = "Error desconocido"
+        last_error = "Unknown error"
         for attempt in range(self.retries + 1):
             try:
                 response = self._client.read_holding_registers(
@@ -239,7 +239,7 @@ class SmaModbusReader:
 
 
 def discover_inverter(subnet: str | None = None, unit_ids: list[int] | None = None) -> str | None:
-    """Busca un inversor SMA en la red local escaneando el puerto 502."""
+    """Search for an SMA inverter on the local network by scanning port 502."""
     if unit_ids is None:
         unit_ids = [1, 3]
 
@@ -249,14 +249,14 @@ def discover_inverter(subnet: str | None = None, unit_ids: list[int] | None = No
             return None
         subnet = ".".join(local_ip.split(".")[:3])
 
-    print(f"Escaneando {subnet}.0/24 en puerto 502...")
+    print(f"Scanning {subnet}.0/24 on port 502...")
 
     for host in range(1, 255):
         ip = f"{subnet}.{host}"
         if not _port_open(ip, 502):
             continue
 
-        print(f"  Puerto 502 abierto en {ip}, probando Modbus...")
+        print(f"  Port 502 open on {ip}, trying Modbus...")
         for unit_id in unit_ids:
             try:
                 with SmaModbusReader(ip, unit_id=unit_id, delay=0.15) as reader:
@@ -267,12 +267,12 @@ def discover_inverter(subnet: str | None = None, unit_ids: list[int] | None = No
                         health = reader.read_register(
                             30201, 2, "u32", 1, "Operation.Health", "Estado"
                         )
-                        print(f"  -> Inversor SMA detectado: {ip} (unit_id={unit_id})")
+                        print(f"  -> SMA inverter detected: {ip} (unit_id={unit_id})")
                         if health.value:
-                            print(f"     Estado: {health.value}")
+                            print(f"     Status: {health.value}")
                         if result.value is not None:
                             print(
-                                f"     Potencia: {format_value('GridMs.TotW', float(result.value), 'W')}"
+                                f"     Power: {format_value('GridMs.TotW', float(result.value), 'W')}"
                             )
                         return ip
             except ConnectionError:
@@ -303,7 +303,7 @@ def _port_open(host: str, port: int, timeout: float = 0.4) -> bool:
 
 
 def print_results(results: list[RegisterValue]) -> None:
-    print(f"\n{'Registro':<22} {'Descripción':<28} {'Valor'}")
+    print(f"\n{'Register':<22} {'Description':<28} {'Value'}")
     print("-" * 72)
     for item in results:
         if item.error:
@@ -321,7 +321,7 @@ def watch(reader: SmaModbusReader, interval: float, keys: list[str]) -> None:
     key_set = set(keys)
     register_map = {name: reg for reg in REGISTERS if (name := reg[4]) in key_set or not keys}
 
-    print(f"Monitorizando cada {interval}s (Ctrl+C para salir)\n")
+    print(f"Monitoring every {interval}s (Ctrl+C to exit)\n")
     try:
         while True:
             timestamp = time.strftime("%H:%M:%S")
@@ -344,7 +344,7 @@ def watch(reader: SmaModbusReader, interval: float, keys: list[str]) -> None:
             print(f"[{timestamp}]  {' | '.join(parts)}")
             time.sleep(interval)
     except KeyboardInterrupt:
-        print("\nMonitor detenido.")
+        print("\nMonitoring stopped.")
 
 
 def main() -> int:
@@ -399,15 +399,15 @@ def main() -> int:
     if args.discover or not host:
         found = discover_inverter()
         if not found:
-            print("No se encontró ningún inversor SMA en la red.", file=sys.stderr)
+            print("No SMA inverter found on the network.", file=sys.stderr)
             print(
-                "Verifica que Modbus TCP esté activado en Sunny Explorer/portal.",
+                "Verify that Modbus TCP is enabled in Sunny Explorer/portal.",
                 file=sys.stderr,
             )
             return 1
         if not host:
             host = found
-            print(f"\nUsando inversor detectado: {host}\n")
+            print(f"\nUsing detected inverter: {host}\n")
 
     try:
         with SmaModbusReader(host, port=args.port, unit_id=args.unit) as reader:
@@ -419,7 +419,7 @@ def main() -> int:
                     results = []
                     for name in args.registers:
                         if name not in reg_map:
-                            print(f"Registro desconocido: {name}", file=sys.stderr)
+                            print(f"Unknown register: {name}", file=sys.stderr)
                             continue
                         address, count, dtype, scale, reg_name, description = reg_map[name]
                         results.append(
@@ -442,7 +442,7 @@ def main() -> int:
                         )
                         time.sleep(reader.delay)
 
-                print(f"Inversor SMA: {host}:{args.port} (unit_id={args.unit})")
+                print(f"SMA inverter: {host}:{args.port} (unit_id={args.unit})")
                 print_results(results)
     except ConnectionError as exc:
         print(exc, file=sys.stderr)

@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Lector Modbus TCP para instalación SMA con Data Manager.
+Modbus TCP reader for SMA plant with Data Manager.
 
-Configuración verificada en red local:
+Verified configuration on local network:
   - Data Manager: 192.168.1.101:502
-  - Inversor 100 kW: unit_id=10
-  - Vatímetro:       unit_id=11
+  - 100 kW inverter: unit_id=10
+  - Power meter:     unit_id=11
 
-Uso:
-  python sma_plant.py                  # lectura rápida (~3-10 s)
-  python sma_plant.py --slow           # si la WiFi del inversor es inestable
-  python sma_plant.py -w -i 10         # monitor cada 10 s
+Usage:
+  python sma_plant.py                  # quick read (~3-10 s)
+  python sma_plant.py --slow           # if inverter WiFi is unstable
+  python sma_plant.py -w -i 10         # monitor every 10 s
 
-Envío al VPS (script aparte):
+Push to VPS (separate script):
   python sma_push.py --once
   python sma_push.py -w -i 60
 """
@@ -27,14 +27,14 @@ from dataclasses import dataclass, field
 from pymodbus.client import ModbusTcpClient
 from pymodbus.exceptions import ModbusException
 
-# --- Configuración por defecto ---
+# --- Default configuration ---
 DEFAULT_HOST = "192.168.1.101"
 DEFAULT_PORT = 502
 INVERTER_UNIT = 10
 METER_UNIT = 11
 
-# Por defecto: lecturas en bloque, pocas peticiones (típ. 2-8 s en LAN/WiFi normal).
-# Si falla por red lenta, usa: --slow
+# By default: block reads, few requests (typically 2-8 s on normal LAN/WiFi).
+# If it fails due to slow network, use: --slow
 DEFAULT_TIMEOUT = 5.0
 DEFAULT_DELAY = 0.15
 DEFAULT_RETRIES = 1
@@ -45,7 +45,7 @@ SLOW_RETRIES = 3
 NAN_S32 = 0x80000000
 NAN_U32 = 0xFFFFFFFF
 
-METER_STALE_ERROR = "Vatímetro sin actualizar (dato obsoleto)"
+METER_STALE_ERROR = "Power meter not updating (stale data)"
 STALE_PROBE_INTERVAL_S = 1.0
 STALE_INVERTER_DELTA_W = 50
 STALE_MIN_EXPORT_KW = 0.5
@@ -121,11 +121,11 @@ def decode(registers: list[int], dtype: str) -> int | None:
     return value
 
 
-# Inversor (unit 10): potencia AC verificada
+# Inverter (unit 10): verified AC power
 INVERTER_POWER: RegisterDef = (30775, "s32", 1, "W", "Potencia AC")
 
-# Strings/DC: no disponibles en este inversor 100 kW vía Data Manager (error Modbus 4).
-# Se intentan solo con --try-strings (1 reintento, sin alargar la lectura habitual).
+# Strings/DC: not available on this 100 kW inverter via Data Manager (Modbus error 4).
+# Only attempted with --try-strings (1 retry, does not extend the normal read time).
 INVERTER_STRING_REGISTERS: list[RegisterDef] = [
     (30769, "s32", 0.001, "A", "DC corriente MPPT1"),
     (30771, "s32", 0.01, "V", "DC tensión MPPT1"),
@@ -137,7 +137,7 @@ INVERTER_STRING_REGISTERS: list[RegisterDef] = [
     (31795, "s32", 0.001, "A", "String 2 corriente"),
 ]
 
-# Vatímetro (unit 11): usar totales para consumo/balance (registros fiables).
+# Power meter (unit 11): use totals for consumption/balance (reliable registers).
 METER_CORE_REGISTERS: list[RegisterDef] = [
     (30865, "s32", 1 / 1000, "kW", "Importación red (TotWIn)"),
     (30867, "s32", 1 / 1000, "kW", "Exportación red (TotWOut)"),
@@ -145,8 +145,8 @@ METER_CORE_REGISTERS: list[RegisterDef] = [
     (31447, "u32", 0.01, "Hz", "Frecuencia"),
 ]
 
-# Detalle por fase (opcional con --phases). La suma de exportación L1+L2+L3 = TotWOut.
-# Las corrientes 31435×V ≈ VA de fase, NO la potencia activa exportada por fase.
+# Per-phase detail (optional with --phases). Sum of L1+L2+L3 export = TotWOut.
+# Currents 31435×V ≈ phase VA, NOT active power exported per phase.
 METER_PHASE_REGISTERS: list[RegisterDef] = [
     (31259, "u32", 1 / 1000, "kW", "Exportación activa L1"),
     (31261, "u32", 1 / 1000, "kW", "Exportación activa L2"),
@@ -280,7 +280,7 @@ class SmaPlantReader:
         dtype: str,
         retries: int,
     ) -> tuple[int | None, str | None]:
-        last_err = "Error desconocido"
+        last_err = "Unknown error"
         for attempt in range(retries + 1):
             raw, err = self._read(client, unit_id, addr, dtype)
             if err is None:
@@ -301,7 +301,7 @@ class SmaPlantReader:
         client = ModbusTcpClient(self.host, port=self.port, timeout=self.timeout, retries=1)
         if not client.connect():
             for _, _, _, unit, label in registers:
-                results[label] = Reading(label, unit=unit, error="Sin conexión")
+                results[label] = Reading(label, unit=unit, error="No connection")
             return results
 
         try:
@@ -332,7 +332,7 @@ class SmaPlantReader:
         retries: int,
     ) -> dict[str, Reading]:
         results: dict[str, Reading] = {}
-        last_err = "Error desconocido"
+        last_err = "Unknown error"
         raw_block: list[int] | None = None
 
         for attempt in range(retries + 1):
@@ -361,7 +361,7 @@ class SmaPlantReader:
         for addr, dtype, scale, unit, label in fields:
             offset = addr - start_addr
             if offset < 0 or offset + 2 > len(raw_block):
-                results[label] = Reading(label, unit=unit, error="Fuera de bloque")
+                results[label] = Reading(label, unit=unit, error="Out of block")
                 continue
             regs = raw_block[offset : offset + 2]
             raw = decode(regs, dtype)
@@ -392,15 +392,15 @@ class SmaPlantReader:
 
         client = ModbusTcpClient(self.host, port=self.port, timeout=self.timeout, retries=0)
         if not client.connect():
-            inv["Potencia AC"] = Reading("Potencia AC", unit="W", error="Sin conexión")
+            inv["Potencia AC"] = Reading("Potencia AC", unit="W", error="No connection")
             for _, _, _, unit, label in METER_CORE_REGISTERS:
-                meter[label] = Reading(label, unit=unit, error="Sin conexión")
+                meter[label] = Reading(label, unit=unit, error="No connection")
             return inv, meter, None, None, None, None
 
         try:
             inv_raw_start = self._read_inverter_power_raw(client)
 
-            # Inversor: 1 petición
+            # Inverter: 1 request
             inv.update(
                 self._read_block(
                     client,
@@ -426,7 +426,7 @@ class SmaPlantReader:
                     else:
                         inv[label] = Reading(label, value=raw * reg[2], unit=reg[3])
 
-            # Vatímetro: 3 peticiones (TotWIn+TotWOut, Hz, TotVA)
+            # Power meter: 3 requests (TotWIn+TotWOut, Hz, TotVA)
             meter.update(
                 self._read_block(
                     client,
@@ -542,7 +542,7 @@ class SmaPlantReader:
         )
 
         prod_kw = (snap.inverter_power.value or 0) / 1000
-        # Consumo instalación = producción - exportación neta al punto de medida
+        # Site consumption = production - net export at metering point
         snap.site_consumption = Reading(
             "Consumo instalación",
             value=prod_kw - (exp - imp),
@@ -655,19 +655,19 @@ def snapshot_to_dict(snap: PlantSnapshot, elapsed_s: float | None = None) -> dic
 
 def print_snapshot(snap: PlantSnapshot, elapsed_s: float | None = None) -> None:
     print(f"\n{'='*60}")
-    print(f"  Instalación SMA — {snap.timestamp}")
+    print(f"  SMA Plant — {snap.timestamp}")
     print(
-        f"  Data Manager: {snap.host} | Inversor unit {snap.inverter_unit} | "
-        f"Vatímetro unit {snap.meter_unit}"
+        f"  Data Manager: {snap.host} | Inverter unit {snap.inverter_unit} | "
+        f"Power meter unit {snap.meter_unit}"
     )
     print(f"{'='*60}")
     if elapsed_s is not None:
-        print(f"  Tiempo de lectura Modbus: {elapsed_s:.1f} s")
+        print(f"  Modbus read time: {elapsed_s:.1f} s")
 
-    print("\n--- Producción ---")
+    print("\n--- Production ---")
     print(f"  {snap.inverter_power.label:30s} {snap.inverter_power.formatted()}")
 
-    print("\n--- Vatímetro ---")
+    print("\n--- Power meter ---")
     if snap.meter_stale:
         print(f"  ⚠ {snap.meter_stale_reason}")
     print(f"  {snap.meter_import.label:30s} {snap.meter_import.formatted()}")
@@ -676,30 +676,30 @@ def print_snapshot(snap: PlantSnapshot, elapsed_s: float | None = None) -> None:
     print(f"  {snap.site_consumption.label:30s} {snap.site_consumption.formatted()}")
     print(f"  {snap.meter_apparent_total.label:30s} {snap.meter_apparent_total.formatted()}")
     print(f"  {snap.meter_frequency.label:30s} {snap.meter_frequency.formatted()}")
-    print("\n  (Totales 30865/30867 son la referencia para consumo y balance.)")
+    print("\n  (Totals 30865/30867 are the reference for consumption and balance.)")
 
     if snap.meter_export_phases:
         phase_sum = sum(r.value or 0 for r in snap.meter_export_phases)
-        print("\n--- Detalle por fase (--phases) ---")
-        print("  Exportación activa por fase (suma ≈ total exportado):")
+        print("\n--- Per-phase detail (--phases) ---")
+        print("  Active export per phase (sum ≈ total exported):")
         for r in snap.meter_export_phases:
             print(f"    {r.label:28s} {r.formatted()}")
-        print(f"    {'Suma fases':28s} {phase_sum:.2f} kW")
+        print(f"    {'Phase sum':28s} {phase_sum:.2f} kW")
         if snap.meter_export_phases and snap.meter_apparent_phases:
-            print("  Potencia aparente por fase (VA, no es exportación activa):")
+            print("  Apparent power per phase (VA, not active export):")
             for r in snap.meter_apparent_phases:
                 print(f"    {r.label:28s} {r.formatted()}")
         if snap.meter_voltage:
-            print("  Tensiones de fase en el vatímetro:")
+            print("  Phase voltages at power meter:")
             for r in snap.meter_voltage:
                 print(f"    {r.label:28s} {r.formatted()}")
 
-    print("\n--- Strings / DC inversor ---")
+    print("\n--- Inverter strings / DC ---")
     if snap.dc_strings:
         for r in snap.dc_strings:
             print(f"  {r.label:30s} {r.formatted()}")
     else:
-        print("  No leídos (usa --try-strings para intentar; suele fallar en este modelo).")
+        print("  Not read (use --try-strings to try; usually fails on this model).")
 
 
 DebugProbe = tuple[int, int, str, float, str, str]  # unit, addr, dtype, scale, unit_label, label
@@ -733,17 +733,17 @@ def debug_modbus(
     samples: int = 5,
     pause_s: float = 2.0,
 ) -> None:
-    """Lecturas repetidas con registros raw para detectar valores congelados."""
+    """Repeated reads with raw registers to detect frozen values."""
     probes = _debug_probes_for(reader)
-    print(f"Depuración Modbus — {reader.host}:{reader.port}")
+    print(f"Modbus debug — {reader.host}:{reader.port}")
     print(
-        f"Inversor unit={reader.inverter_unit} | Vatímetro unit={reader.meter_unit} | "
-        f"{samples} muestras cada {pause_s}s\n"
+        f"Inverter unit={reader.inverter_unit} | Power meter unit={reader.meter_unit} | "
+        f"{samples} samples every {pause_s}s\n"
     )
 
     client = ModbusTcpClient(reader.host, port=reader.port, timeout=reader.timeout, retries=0)
     if not client.connect():
-        print("ERROR: sin conexión al Data Manager", file=sys.stderr)
+        print("ERROR: no connection to Data Manager", file=sys.stderr)
         return
 
     history: dict[str, list[str]] = {label: [] for *_, label in probes}
@@ -751,7 +751,7 @@ def debug_modbus(
     try:
         for sample in range(1, samples + 1):
             ts = time.strftime("%H:%M:%S")
-            print(f"--- Muestra {sample}/{samples} [{ts}] ---")
+            print(f"--- Sample {sample}/{samples} [{ts}] ---")
 
             for unit_id, addr, dtype, scale, unit_label, label in probes:
                 try:
@@ -774,40 +774,40 @@ def debug_modbus(
                 history[label].append(line)
                 print(f"  {label:<40s} {line}")
 
-            # Comparar lectura en bloque vs individual en import/export
+            # Compare block read vs individual for import/export
             try:
                 block = client.read_holding_registers(
                     address=30865, count=4, device_id=reader.meter_unit
                 )
                 if block.isError():
-                    print(f"  Bloque 30865×4                      ERROR {block}")
+                    print(f"  Block 30865×4                      ERROR {block}")
                 else:
                     imp = decode(block.registers[0:2], "s32")
                     exp = decode(block.registers[2:4], "s32")
                     print(
-                        f"  Bloque 30865×4                      "
+                        f"  Block 30865×4                      "
                         f"import={_scaled_value(imp, 1/1000)} kW | "
                         f"export={_scaled_value(exp, 1/1000)} kW | "
                         f"{_format_raw_regs(block.registers)}"
                     )
             except Exception as exc:  # noqa: BLE001
-                print(f"  Bloque 30865×4                      ERROR: {exc}")
+                print(f"  Block 30865×4                      ERROR: {exc}")
 
             if sample < samples:
                 time.sleep(pause_s)
             print()
 
-        print("--- Resumen: ¿cambia entre muestras? ---")
+        print("--- Summary: does it change between samples? ---")
         for label, values in history.items():
             unique = len(set(values))
-            status = "VARÍA" if unique > 1 else "CONGELADO"
-            print(f"  {label:<40s} {status} ({unique} valor/es distinto/s)")
+            status = "VARIES" if unique > 1 else "FROZEN"
+            print(f"  {label:<40s} {status} ({unique} distinct value(s))")
     finally:
         client.close()
 
 
 def watch(reader: SmaPlantReader, interval: float) -> None:
-    print(f"Monitorizando cada {interval}s (Ctrl+C para salir)\n")
+    print(f"Monitoring every {interval}s (Ctrl+C to exit)\n")
     try:
         while True:
             snap = reader.read_snapshot()
@@ -817,12 +817,12 @@ def watch(reader: SmaPlantReader, interval: float) -> None:
             exp = snap.meter_export.formatted()
             print(
                 f"[{snap.timestamp}]  "
-                f"Producción={prod} | Consumo instalación={cons} | "
-                f"Exportación={exp} | Balance={bal}"
+                f"Production={prod} | Site consumption={cons} | "
+                f"Export={exp} | Balance={bal}"
             )
             time.sleep(interval)
     except KeyboardInterrupt:
-        print("\nMonitor detenido.")
+        print("\nMonitoring stopped.")
 
 
 def main() -> int:

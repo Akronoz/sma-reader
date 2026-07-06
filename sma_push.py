@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Envía lecturas de la planta SMA al VPS (push desde la RPi).
+Push SMA plant readings to the VPS (push from the RPi).
 
-Variables de entorno:
-  SMA_VPS_URL     Endpoint del servidor (ej. https://tu-vps/api/v1/snapshots)
-  SMA_API_KEY     Clave compartida (header X-API-Key)
-  SMA_INTERVAL    Segundos entre envíos (default: 60)
-  SMA_MODBUS_HOST IP del Data Manager (default: 192.168.1.101)
-  SMA_SLOW        "1" para modo red lenta (mismos valores que sma_plant.py --slow)
-  SMA_STALE_CHECK "0" para desactivar la detección de vatímetro obsoleto
+Environment variables:
+  SMA_VPS_URL     Server endpoint (e.g. https://your-vps/api/v1/snapshots)
+  SMA_API_KEY     Shared key (X-API-Key header)
+  SMA_INTERVAL    Seconds between pushes (default: 60)
+  SMA_MODBUS_HOST Data Manager IP (default: 192.168.1.101)
+  SMA_SLOW        "1" for slow network mode (same values as sma_plant.py --slow)
+  SMA_STALE_CHECK "0" to disable stale power meter detection
 
-Uso:
-  python sma_push.py --once          # prueba: una lectura y un envío
-  python sma_push.py                 # bucle continuo
-  python sma_push.py -w -i 30        # equivalente, intervalo 30 s
+Usage:
+  python sma_push.py --once          # test: one read and one push
+  python sma_push.py                 # continuous loop
+  python sma_push.py -w -i 30        # equivalent, 30 s interval
 """
 
 from __future__ import annotations
@@ -125,14 +125,14 @@ def push_once(reader: SmaPlantReader, config: dict, verbose: bool = True) -> boo
     if verbose:
         prod = snap.inverter_power.formatted()
         cons = snap.site_consumption.formatted()
-        meter_note = " | Vatímetro obsoleto" if snap.meter_stale else ""
+        meter_note = " | Stale power meter" if snap.meter_stale else ""
         if ok:
             print(
-                f"[{payload['sent_at']}] OK ({detail}) | Producción={prod} | Consumo={cons}{meter_note}"
+                f"[{payload['sent_at']}] OK ({detail}) | Production={prod} | Consumption={cons}{meter_note}"
             )
         else:
             print(
-                f"[{payload['sent_at']}] ERROR: {detail} (último snapshot en {CACHE_FILE})",
+                f"[{payload['sent_at']}] ERROR: {detail} (last snapshot in {CACHE_FILE})",
                 file=sys.stderr,
             )
     return ok
@@ -158,10 +158,10 @@ def main() -> int:
         config["interval"] = args.interval
 
     if not config["vps_url"]:
-        print("Falta SMA_VPS_URL o --vps-url", file=sys.stderr)
+        print("Missing SMA_VPS_URL or --vps-url", file=sys.stderr)
         return 1
     if not config["api_key"]:
-        print("Falta SMA_API_KEY o --api-key", file=sys.stderr)
+        print("Missing SMA_API_KEY or --api-key", file=sys.stderr)
         return 1
 
     reader = SmaPlantReader(
@@ -177,13 +177,13 @@ def main() -> int:
 
     loop = args.watch or not args.once
     if loop:
-        print(f"Enviando a {config['vps_url']} cada {config['interval']}s (Ctrl+C para salir)")
+        print(f"Sending to {config['vps_url']} every {config['interval']}s (Ctrl+C to exit)")
         try:
             while True:
                 push_once(reader, config, verbose=not args.quiet)
                 time.sleep(config["interval"])
         except KeyboardInterrupt:
-            print("\nDetenido.")
+            print("\nStopped.")
         return 0
 
     return 0 if push_once(reader, config, verbose=not args.quiet) else 1
